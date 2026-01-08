@@ -68,9 +68,6 @@ function decodeBasicEntities(s) {
  * Make text safe for XML building:
  * - remove/convert problematic HTML entities (e.g. &nbsp;)
  * - normalize whitespace
- *
- * Note: xmlbuilder2 will escape &, <, > etc. automatically,
- * but it cannot handle unknown XML entities like &nbsp; if they remain in the raw text.
  */
 function xmlSafeText(s) {
   if (!s) return "";
@@ -101,31 +98,9 @@ function getTranslation(translations, key) {
 function formatPrice(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return "";
+  // Feedyio often outputs without decimals; but Zbozi accepts decimals too.
+  // Keep 2 decimals for safety/consistency.
   return n.toFixed(2);
-}
-
-function buildZboziXml(items) {
-  const root = create({ version: "1.0", encoding: "UTF-8" }).ele("SHOP");
-
-  for (const item of items) {
-    const si = root.ele("SHOPITEM");
-
-    // Required / core
-    si.ele("ITEM_ID").txt(item.itemId);
-    si.ele("ITEMGROUP_ID").txt(item.itemGroupId);
-    si.ele("PRODUCTNAME").txt(item.productName);
-    si.ele("DESCRIPTION").txt(item.description);
-    si.ele("URL").txt(item.url);
-    si.ele("IMGURL").txt(item.imgUrl);
-    si.ele("PRICE_VAT").txt(item.priceVat);
-
-    // Requested extras
-    if (item.manufacturer) si.ele("MANUFACTURER").txt(item.manufacturer);
-    if (item.ean) si.ele("EAN").txt(item.ean);
-    si.ele("DELIVERY_DATE").txt(String(item.deliveryDate));
-  }
-
-  return root.end({ prettyPrint: true });
 }
 
 async function adminGraphQL(query, variables = {}) {
@@ -152,6 +127,12 @@ function firstImageUrl(p) {
   return p.featuredImage?.url || p.images?.edges?.[0]?.node?.url || "";
 }
 
+function alternativeImageUrls(p, primaryUrl) {
+  const urls = (p.images?.edges || []).map((e) => e?.node?.url).filter(Boolean);
+  const unique = [...new Set(urls)];
+  return unique.filter((u) => u !== primaryUrl).slice(0, 10);
+}
+
 function pickInStockVariant(variantEdges) {
   // Exclude out-of-stock: require inventoryQuantity > 0
   for (const e of variantEdges || []) {
@@ -159,6 +140,63 @@ function pickInStockVariant(variantEdges) {
     if (typeof v.inventoryQuantity === "number" && v.inventoryQuantity > 0) return v;
   }
   return null;
+}
+
+function findSizeValue(selectedOptions) {
+  const opts = selectedOptions || [];
+  const hit =
+    opts.find((o) => (o?.name || "").toLowerCase() === "size") ||
+    opts.find((o) => (o?.name || "").toLowerCase() === "velikost");
+  return hit?.value ? xmlSafeText(hit.value) : "";
+}
+
+function buildZboziXml(items) {
+  // IMPORTANT: namespace required by Zbozi
+  const root = create({ version: "1.0", encoding: "UTF-8" })
+    .ele("SHOP")
+    .att("xmlns", "http://www.zbozi.cz/ns/offer/1.0");
+
+  for (const item of items) {
+    const si = root.ele("SHOPITEM");
+
+    // Feedyio-style IDs (numeric)
+    si.ele("ITEM_ID").txt(item.itemId); // variant legacyResourceId
+    if (item.itemGroupId) si.ele("ITEMGROUP_ID").txt(item.itemGroupId); // product legacyResourceId
+
+    si.ele("PRODUCTNAME").txt(item.productName);
+    si.ele("URL").txt(item.url);
+    si.ele("IMGURL").txt(item.imgUrl);
+    si.ele("PRICE_VAT").txt(item.priceVat);
+
+    if (item.manufacturer) si.ele("MANUFACTURER").txt(item.manufacturer);
+
+    // Only include EAN if you actually have one (avoid empty tags)
+    if (item.ean) si.ele("EAN").txt(item.ean);
+
+    // Like Feedyio: internal code / name (SKU or your internal text)
+    if (item.productNo) si.ele("PRODUCTNO").txt(item.productNo);
+
+    // Like Feedyio
+    si.ele("CONDITION").txt("new");
+
+    si.ele("DESCRIPTION").txt(item.description);
+
+    // Extra product images (repeatable)
+    for (const alt of item.altImgUrls || []) {
+      si.ele("IMGURL_ALTERNATIVE").txt(alt);
+    }
+
+    // Variant parameters (repeatable PARAM blocks)
+    for (const p of item.params || []) {
+      const param = si.ele("PARAM");
+      param.ele("PARAM_NAME").txt(p.name);
+      param.ele("VAL").txt(p.val);
+    }
+
+    si.ele("DELIVERY_DATE").txt(String(item.deliveryDate));
+  }
+
+  return root.end({ prettyPrint: true });
 }
 
 // Shared handler so /feed.xml and /feed-cz.xml serve the same output
@@ -170,13 +208,13 @@ async function feedHandler(req, res) {
           pageInfo { hasNextPage endCursor }
           edges {
             node {
-              id
+              legacyResourceId
               title
               vendor
               handle
               descriptionHtml
               featuredImage { url }
-              images(first: 1) { edges { node { url } } }
+              images(first: 10) { edges { node { url } } }
 
               translations(locale: "cs") {
                 key
@@ -186,10 +224,11 @@ async function feedHandler(req, res) {
               variants(first: 50) {
                 edges {
                   node {
-                    id
+                    legacyResourceId
                     sku
                     barcode
                     inventoryQuantity
+                    selectedOptions { name value }
 
                     contextualPricing(context: { country: CZ }) {
                       price { amount currencyCode }
@@ -232,21 +271,38 @@ async function feedHandler(req, res) {
 
         const description = cleanDescription(xmlSafeText(stripHtml(descHtmlCsRaw)));
 
-        // Czech market pricing (CZ)
+        // CZ market pricing
         const cp = v.contextualPricing?.price;
         const priceVat = cp?.amount ? formatPrice(cp.amount) : "";
-        const currency = cp?.currencyCode || "";
+        if (!priceVat) continue; // if no price, better to skip than produce broken item
 
-        const url = `https://${SHOP_PUBLIC_DOMAIN}/products/${p.handle}`;
+        // Feedyio-style: URL includes variant
+        const variantIdNum = String(v.legacyResourceId || "").trim();
+        if (!variantIdNum) continue;
+
+        const url = `https://${SHOP_PUBLIC_DOMAIN}/products/${p.handle}?variant=${variantIdNum}`;
 
         const manufacturer = xmlSafeText(p.vendor || "");
         const ean = xmlSafeText(v.barcode || "");
 
-        // Group by product
-        const itemGroupId = xmlSafeText(p.id);
+        // Feedyio-like grouping numeric (product legacyResourceId)
+        const itemGroupId = xmlSafeText(String(p.legacyResourceId || "").trim());
 
-        // Unique item id: prefer SKU, else variant id
-        const itemId = xmlSafeText(v.sku && String(v.sku).trim() ? v.sku : v.id);
+        // ITEM_ID numeric (variant legacyResourceId)
+        const itemId = xmlSafeText(variantIdNum);
+
+        // PRODUCTNO: prefer SKU, else fallback to product name (like your old internal id)
+        const productNo = xmlSafeText(v.sku || "") || productName;
+
+        // Alt images
+        const altImgUrls = alternativeImageUrls(p, imgUrl);
+
+        // PARAM: size (Velikost)
+        const sizeVal = findSizeValue(v.selectedOptions);
+        const params = [];
+        if (sizeVal) {
+          params.push({ name: "Velikost", val: sizeVal });
+        }
 
         items.push({
           itemId,
@@ -255,11 +311,13 @@ async function feedHandler(req, res) {
           description,
           url: xmlSafeText(url),
           imgUrl: xmlSafeText(imgUrl),
+          altImgUrls: altImgUrls.map(xmlSafeText),
           priceVat: xmlSafeText(priceVat),
           manufacturer,
           ean,
+          productNo,
+          params,
           deliveryDate: DELIVERY_DATE_DEFAULT,
-          currency,
         });
       }
 
@@ -276,7 +334,7 @@ async function feedHandler(req, res) {
         {
           error: String(err?.message || err),
           hint:
-            "Ensure Dev Dashboard app scopes include read_products and read_inventory, and the app is installed on this store. If CZK is blank, ensure Markets/pricing for CZ is configured for this store.",
+            "Ensure Dev Dashboard app scopes include read_products and read_inventory, and the app is installed on this store. If CZK pricing is blank, ensure Markets/pricing for CZ is configured.",
         },
         null,
         2
@@ -288,7 +346,7 @@ async function feedHandler(req, res) {
 // New CZ feed name
 app.get("/feed-cz.xml", feedHandler);
 
-// Keep old endpoint too (optional but recommended)
+// Keep old endpoint too (optional)
 app.get("/feed.xml", feedHandler);
 
 app.get("/", (req, res) =>
@@ -300,6 +358,3 @@ app.get("/", (req, res) =>
 app.listen(PORT, () => {
   console.log(`Feed server running: http://localhost:${PORT}/feed-cz.xml`);
 });
-
-
-
