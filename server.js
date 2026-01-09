@@ -151,24 +151,20 @@ async function adminGraphQL(query, variables = {}) {
     const currentlyAvailable = Number(throttle?.currentlyAvailable || 0);
 
     if (throttled) {
-      // Wait enough to restore some points, otherwise exponential backoff
       let waitMs;
       if (Number.isFinite(restoreRate) && restoreRate > 0) {
-        // Restore ~100 points (min 2s)
         waitMs = Math.max(2000, Math.ceil((100 / restoreRate) * 1000));
       } else {
-        waitMs = Math.min(30000, 500 * Math.pow(2, attempt)); // 0.5s,1s,2s,4s.. max 30s
+        waitMs = Math.min(30000, 500 * Math.pow(2, attempt));
       }
       await sleep(waitMs);
       continue;
     }
 
-    // Other GraphQL errors
     if (errors.length) {
       throw new Error(`Admin GraphQL errors: ${JSON.stringify(errors)}`);
     }
 
-    // If we are near the limit, small pause
     if (Number.isFinite(currentlyAvailable) && currentlyAvailable < 50) {
       await sleep(1000);
     }
@@ -193,13 +189,14 @@ function alternativeImageUrls(p, primaryUrl) {
   return unique.filter((u) => u !== primaryUrl).slice(0, 10);
 }
 
-function pickInStockVariant(variantEdges) {
-  // Exclude out-of-stock: require inventoryQuantity > 0
+// NEW: return all in-stock variants
+function inStockVariants(variantEdges) {
+  const out = [];
   for (const e of variantEdges || []) {
     const v = e.node;
-    if (typeof v.inventoryQuantity === "number" && v.inventoryQuantity > 0) return v;
+    if (typeof v.inventoryQuantity === "number" && v.inventoryQuantity > 0) out.push(v);
   }
-  return null;
+  return out;
 }
 
 function findSizeValue(selectedOptions) {
@@ -310,16 +307,13 @@ async function feedHandler(req, res) {
       for (const edge of conn.edges) {
         const p = edge.node;
 
-        const v = pickInStockVariant(p.variants?.edges);
-        if (!v) continue;
-
+        // Shared product-level fields
         const imgUrl = firstImageUrl(p);
         if (!imgUrl) continue;
 
         const translations = p.translations || [];
-
         const titleCsRaw = getTranslation(translations, "title") || p.title;
-        const productName = xmlSafeText(titleCsRaw);
+        const productNameBase = xmlSafeText(titleCsRaw);
 
         const descHtmlCsRaw =
           getTranslation(translations, "description_html") ||
@@ -329,45 +323,53 @@ async function feedHandler(req, res) {
 
         const description = cleanDescription(xmlSafeText(stripHtml(descHtmlCsRaw)));
 
-        // CZ market pricing
-        const cp = v.contextualPricing?.price;
-        const priceVat = cp?.amount ? formatPrice(cp.amount) : "";
-        if (!priceVat) continue;
-
-        const variantIdNum = String(v.legacyResourceId || "").trim();
-        if (!variantIdNum) continue;
-
-        const url = `https://${SHOP_PUBLIC_DOMAIN}/products/${p.handle}?variant=${variantIdNum}`;
-
         const manufacturer = xmlSafeText(p.vendor || "");
-        const ean = xmlSafeText(v.barcode || "");
-
         const itemGroupId = xmlSafeText(String(p.legacyResourceId || "").trim());
-        const itemId = xmlSafeText(variantIdNum);
 
-        const productNo = xmlSafeText(v.sku || "") || productName;
+        const altImgUrls = alternativeImageUrls(p, imgUrl).map(xmlSafeText);
 
-        const altImgUrls = alternativeImageUrls(p, imgUrl);
+        // NEW: emit one SHOPITEM per in-stock variant
+        const variants = inStockVariants(p.variants?.edges);
+        if (!variants.length) continue;
 
-        const sizeVal = findSizeValue(v.selectedOptions);
-        const params = [];
-        if (sizeVal) params.push({ name: "Velikost", val: sizeVal });
+        for (const v of variants) {
+          // CZ market pricing
+          const cp = v.contextualPricing?.price;
+          const priceVat = cp?.amount ? formatPrice(cp.amount) : "";
+          if (!priceVat) continue;
 
-        items.push({
-          itemId,
-          itemGroupId,
-          productName,
-          description,
-          url: xmlSafeText(url),
-          imgUrl: xmlSafeText(imgUrl),
-          altImgUrls: altImgUrls.map(xmlSafeText),
-          priceVat: xmlSafeText(priceVat),
-          manufacturer,
-          ean,
-          productNo,
-          params,
-          deliveryDate: DELIVERY_DATE_DEFAULT,
-        });
+          const variantIdNum = String(v.legacyResourceId || "").trim();
+          if (!variantIdNum) continue;
+
+          const url = `https://${SHOP_PUBLIC_DOMAIN}/products/${p.handle}?variant=${variantIdNum}`;
+
+          const ean = xmlSafeText(v.barcode || "");
+          const productNo = xmlSafeText(v.sku || "") || productNameBase;
+
+          // PARAM: size (Velikost)
+          const sizeVal = findSizeValue(v.selectedOptions);
+          const params = [];
+          if (sizeVal) params.push({ name: "Velikost", val: sizeVal });
+
+          // OPTIONAL (matches Feedyio style): append size to product name
+          const productName = sizeVal ? `${productNameBase} ${sizeVal}` : productNameBase;
+
+          items.push({
+            itemId: xmlSafeText(variantIdNum),
+            itemGroupId,
+            productName: xmlSafeText(productName),
+            description,
+            url: xmlSafeText(url),
+            imgUrl: xmlSafeText(imgUrl),
+            altImgUrls,
+            priceVat: xmlSafeText(priceVat),
+            manufacturer,
+            ean,
+            productNo,
+            params,
+            deliveryDate: DELIVERY_DATE_DEFAULT,
+          });
+        }
       }
 
       if (!conn.pageInfo.hasNextPage) break;
@@ -388,7 +390,7 @@ async function feedHandler(req, res) {
         {
           error: String(err?.message || err),
           hint:
-            "If you see THROTTLED, increase FEED_CACHE_SECONDS and ensure Zbozi validation isn't repeatedly fetching during tests.",
+            "If you see THROTTLED, increase FEED_CACHE_SECONDS. If variants are missing, increase variants(first: 20).",
         },
         null,
         2
@@ -407,4 +409,5 @@ app.get("/", (req, res) =>
 app.listen(PORT, () => {
   console.log(`Feed server running: http://localhost:${PORT}/feed-cz.xml`);
 });
+
 
