@@ -13,6 +13,11 @@ const PORT = Number(process.env.PORT || 3000);
 // Default delivery time in days (Zbozi: 0=immediately, 1=next day, 3=~3 days etc.)
 const DELIVERY_DATE_DEFAULT = Number(process.env.DELIVERY_DATE_DEFAULT || 3);
 
+// Cache generated XML to avoid hammering Shopify (important for Zbozi validation)
+const FEED_CACHE_SECONDS = Number(process.env.FEED_CACHE_SECONDS || 900); // 15 min default
+let cachedFeedXml = "";
+let cachedFeedUntil = 0;
+
 if (!SHOP_MYSHOPIFY_DOMAIN || !SHOP_PUBLIC_DOMAIN || !CLIENT_ID || !CLIENT_SECRET) {
   console.error(
     "Missing env vars. Need SHOP_MYSHOPIFY_DOMAIN, SHOP_PUBLIC_DOMAIN, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET."
@@ -98,29 +103,84 @@ function getTranslation(translations, key) {
 function formatPrice(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return "";
-  // Feedyio often outputs without decimals; but Zbozi accepts decimals too.
-  // Keep 2 decimals for safety/consistency.
   return n.toFixed(2);
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Throttle-aware Admin GraphQL with retries
 async function adminGraphQL(query, variables = {}) {
   const token = await getAdminAccessToken();
+  const url = `https://${SHOP_MYSHOPIFY_DOMAIN}/admin/api/2025-07/graphql.json`;
 
-  const res = await fetch(`https://${SHOP_MYSHOPIFY_DOMAIN}/admin/api/2025-07/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": token,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token,
+      },
+      body: JSON.stringify({ query, variables }),
+    });
 
-  if (!res.ok) throw new Error(`Admin GraphQL HTTP ${res.status}: ${await res.text()}`);
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`Admin GraphQL non-JSON response (HTTP ${res.status}): ${text.slice(0, 500)}`);
+    }
 
-  const json = await res.json();
-  if (json.errors?.length) throw new Error(`Admin GraphQL errors: ${JSON.stringify(json.errors)}`);
+    // Handle HTTP throttling (429)
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get("retry-after") || "1");
+      await sleep(Math.min(30, Math.max(1, retryAfter)) * 1000);
+      continue;
+    }
 
-  return json.data;
+    const errors = json?.errors || [];
+    const throttled = errors.some(
+      (e) => e?.extensions?.code === "THROTTLED" || (e?.message || "").toLowerCase().includes("throttled")
+    );
+
+    // Shopify GraphQL cost throttle info (if provided)
+    const throttle = json?.extensions?.cost?.throttleStatus;
+    const restoreRate = Number(throttle?.restoreRate || 50);
+    const currentlyAvailable = Number(throttle?.currentlyAvailable || 0);
+
+    if (throttled) {
+      // Wait enough to restore some points, otherwise exponential backoff
+      let waitMs;
+      if (Number.isFinite(restoreRate) && restoreRate > 0) {
+        // Restore ~100 points (min 2s)
+        waitMs = Math.max(2000, Math.ceil((100 / restoreRate) * 1000));
+      } else {
+        waitMs = Math.min(30000, 500 * Math.pow(2, attempt)); // 0.5s,1s,2s,4s.. max 30s
+      }
+      await sleep(waitMs);
+      continue;
+    }
+
+    // Other GraphQL errors
+    if (errors.length) {
+      throw new Error(`Admin GraphQL errors: ${JSON.stringify(errors)}`);
+    }
+
+    // If we are near the limit, small pause
+    if (Number.isFinite(currentlyAvailable) && currentlyAvailable < 50) {
+      await sleep(1000);
+    }
+
+    if (!res.ok) {
+      throw new Error(`Admin GraphQL HTTP ${res.status}: ${text.slice(0, 500)}`);
+    }
+
+    return json.data;
+  }
+
+  throw new Error("Admin GraphQL throttled too long; retries exhausted.");
 }
 
 function firstImageUrl(p) {
@@ -151,7 +211,6 @@ function findSizeValue(selectedOptions) {
 }
 
 function buildZboziXml(items) {
-  // IMPORTANT: namespace required by Zbozi
   const root = create({ version: "1.0", encoding: "UTF-8" })
     .ele("SHOP")
     .att("xmlns", "http://www.zbozi.cz/ns/offer/1.0");
@@ -159,9 +218,8 @@ function buildZboziXml(items) {
   for (const item of items) {
     const si = root.ele("SHOPITEM");
 
-    // Feedyio-style IDs (numeric)
-    si.ele("ITEM_ID").txt(item.itemId); // variant legacyResourceId
-    if (item.itemGroupId) si.ele("ITEMGROUP_ID").txt(item.itemGroupId); // product legacyResourceId
+    si.ele("ITEM_ID").txt(item.itemId);
+    if (item.itemGroupId) si.ele("ITEMGROUP_ID").txt(item.itemGroupId);
 
     si.ele("PRODUCTNAME").txt(item.productName);
     si.ele("URL").txt(item.url);
@@ -169,24 +227,16 @@ function buildZboziXml(items) {
     si.ele("PRICE_VAT").txt(item.priceVat);
 
     if (item.manufacturer) si.ele("MANUFACTURER").txt(item.manufacturer);
-
-    // Only include EAN if you actually have one (avoid empty tags)
     if (item.ean) si.ele("EAN").txt(item.ean);
-
-    // Like Feedyio: internal code / name (SKU or your internal text)
     if (item.productNo) si.ele("PRODUCTNO").txt(item.productNo);
 
-    // Like Feedyio
     si.ele("CONDITION").txt("new");
-
     si.ele("DESCRIPTION").txt(item.description);
 
-    // Extra product images (repeatable)
     for (const alt of item.altImgUrls || []) {
       si.ele("IMGURL_ALTERNATIVE").txt(alt);
     }
 
-    // Variant parameters (repeatable PARAM blocks)
     for (const p of item.params || []) {
       const param = si.ele("PARAM");
       param.ele("PARAM_NAME").txt(p.name);
@@ -202,6 +252,14 @@ function buildZboziXml(items) {
 // Shared handler so /feed.xml and /feed-cz.xml serve the same output
 async function feedHandler(req, res) {
   try {
+    // Serve cached XML if fresh
+    const now = Date.now();
+    if (cachedFeedXml && now < cachedFeedUntil) {
+      res.setHeader("Content-Type", "application/xml; charset=utf-8");
+      res.status(200).send(cachedFeedXml);
+      return;
+    }
+
     const query = `
       query ZboziAdminFeed($first: Int!, $after: String) {
         products(first: $first, after: $after, query: "status:active") {
@@ -214,14 +272,14 @@ async function feedHandler(req, res) {
               handle
               descriptionHtml
               featuredImage { url }
-              images(first: 10) { edges { node { url } } }
+              images(first: 4) { edges { node { url } } }
 
               translations(locale: "cs") {
                 key
                 value
               }
 
-              variants(first: 50) {
+              variants(first: 20) {
                 edges {
                   node {
                     legacyResourceId
@@ -274,9 +332,8 @@ async function feedHandler(req, res) {
         // CZ market pricing
         const cp = v.contextualPricing?.price;
         const priceVat = cp?.amount ? formatPrice(cp.amount) : "";
-        if (!priceVat) continue; // if no price, better to skip than produce broken item
+        if (!priceVat) continue;
 
-        // Feedyio-style: URL includes variant
         const variantIdNum = String(v.legacyResourceId || "").trim();
         if (!variantIdNum) continue;
 
@@ -285,24 +342,16 @@ async function feedHandler(req, res) {
         const manufacturer = xmlSafeText(p.vendor || "");
         const ean = xmlSafeText(v.barcode || "");
 
-        // Feedyio-like grouping numeric (product legacyResourceId)
         const itemGroupId = xmlSafeText(String(p.legacyResourceId || "").trim());
-
-        // ITEM_ID numeric (variant legacyResourceId)
         const itemId = xmlSafeText(variantIdNum);
 
-        // PRODUCTNO: prefer SKU, else fallback to product name (like your old internal id)
         const productNo = xmlSafeText(v.sku || "") || productName;
 
-        // Alt images
         const altImgUrls = alternativeImageUrls(p, imgUrl);
 
-        // PARAM: size (Velikost)
         const sizeVal = findSizeValue(v.selectedOptions);
         const params = [];
-        if (sizeVal) {
-          params.push({ name: "Velikost", val: sizeVal });
-        }
+        if (sizeVal) params.push({ name: "Velikost", val: sizeVal });
 
         items.push({
           itemId,
@@ -326,6 +375,11 @@ async function feedHandler(req, res) {
     }
 
     const xml = buildZboziXml(items);
+
+    // Cache for FEED_CACHE_SECONDS
+    cachedFeedXml = xml;
+    cachedFeedUntil = Date.now() + FEED_CACHE_SECONDS * 1000;
+
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
     res.status(200).send(xml);
   } catch (err) {
@@ -334,7 +388,7 @@ async function feedHandler(req, res) {
         {
           error: String(err?.message || err),
           hint:
-            "Ensure Dev Dashboard app scopes include read_products and read_inventory, and the app is installed on this store. If CZK pricing is blank, ensure Markets/pricing for CZ is configured.",
+            "If you see THROTTLED, increase FEED_CACHE_SECONDS and ensure Zbozi validation isn't repeatedly fetching during tests.",
         },
         null,
         2
@@ -343,18 +397,14 @@ async function feedHandler(req, res) {
   }
 }
 
-// New CZ feed name
 app.get("/feed-cz.xml", feedHandler);
-
-// Keep old endpoint too (optional)
 app.get("/feed.xml", feedHandler);
 
 app.get("/", (req, res) =>
-  res
-    .type("text")
-    .send("OK. Use /feed-cz.xml (Czech feed). Also available: /feed.xml")
+  res.type("text").send("OK. Use /feed-cz.xml (Czech feed). Also available: /feed.xml")
 );
 
 app.listen(PORT, () => {
   console.log(`Feed server running: http://localhost:${PORT}/feed-cz.xml`);
 });
+
