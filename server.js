@@ -10,8 +10,14 @@ const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const PORT = Number(process.env.PORT || 3000);
 
-// Default delivery time in days (Zbozi: 0=immediately, 1=next day, 3=~3 days etc.)
-const DELIVERY_DATE_DEFAULT = Number(process.env.DELIVERY_DATE_DEFAULT || 3);
+// Delivery time in days (Zbozi buckets: 0, 1-3, 4-7, 8+)
+const DELIVERY_DATE_DEFAULT = Number(process.env.DELIVERY_DATE_DEFAULT || 8);
+
+// NEW: shipping method + price (Zbozi expects numeric value; use CZK to match PRICE_VAT)
+const DELIVERY_ID_DEFAULT = String(process.env.DELIVERY_ID_DEFAULT || "UPS").trim();
+
+// €10.50 ≈ 254.92 CZK at ~24.278 CZK/EUR (set exact CZK here)
+const DELIVERY_PRICE_DEFAULT = Number(process.env.DELIVERY_PRICE_DEFAULT || 254.92);
 
 // Cache generated XML to avoid hammering Shopify (important for Zbozi validation)
 const FEED_CACHE_SECONDS = Number(process.env.FEED_CACHE_SECONDS || 900); // 15 min default
@@ -106,6 +112,13 @@ function formatPrice(amount) {
   return n.toFixed(2);
 }
 
+// NEW: shipping price formatter (same numeric rules as PRICE_VAT: max 2 decimals)
+function formatCzk(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return "";
+  return n.toFixed(2);
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -189,7 +202,7 @@ function alternativeImageUrls(p, primaryUrl) {
   return unique.filter((u) => u !== primaryUrl).slice(0, 10);
 }
 
-// NEW: return all in-stock variants
+// return all in-stock variants
 function inStockVariants(variantEdges) {
   const out = [];
   for (const e of variantEdges || []) {
@@ -241,6 +254,14 @@ function buildZboziXml(items) {
     }
 
     si.ele("DELIVERY_DATE").txt(String(item.deliveryDate));
+
+    // NEW: DELIVERY block
+    if (item.deliveryId && item.deliveryPrice) {
+      const d = si.ele("DELIVERY");
+      d.ele("DELIVERY_ID").txt(item.deliveryId);
+      d.ele("DELIVERY_PRICE").txt(item.deliveryPrice);
+      // (optional) d.ele("DELIVERY_PRICE_COD").txt("...") if you offer cash on delivery
+    }
   }
 
   return root.end({ prettyPrint: true });
@@ -307,7 +328,6 @@ async function feedHandler(req, res) {
       for (const edge of conn.edges) {
         const p = edge.node;
 
-        // Shared product-level fields
         const imgUrl = firstImageUrl(p);
         if (!imgUrl) continue;
 
@@ -328,12 +348,10 @@ async function feedHandler(req, res) {
 
         const altImgUrls = alternativeImageUrls(p, imgUrl).map(xmlSafeText);
 
-        // NEW: emit one SHOPITEM per in-stock variant
         const variants = inStockVariants(p.variants?.edges);
         if (!variants.length) continue;
 
         for (const v of variants) {
-          // CZ market pricing
           const cp = v.contextualPricing?.price;
           const priceVat = cp?.amount ? formatPrice(cp.amount) : "";
           if (!priceVat) continue;
@@ -346,12 +364,10 @@ async function feedHandler(req, res) {
           const ean = xmlSafeText(v.barcode || "");
           const productNo = xmlSafeText(v.sku || "") || productNameBase;
 
-          // PARAM: size (Velikost)
           const sizeVal = findSizeValue(v.selectedOptions);
           const params = [];
           if (sizeVal) params.push({ name: "Velikost", val: sizeVal });
 
-          // OPTIONAL (matches Feedyio style): append size to product name
           const productName = sizeVal ? `${productNameBase} ${sizeVal}` : productNameBase;
 
           items.push({
@@ -368,6 +384,10 @@ async function feedHandler(req, res) {
             productNo,
             params,
             deliveryDate: DELIVERY_DATE_DEFAULT,
+
+            // NEW
+            deliveryId: xmlSafeText(DELIVERY_ID_DEFAULT),
+            deliveryPrice: xmlSafeText(formatCzk(DELIVERY_PRICE_DEFAULT)),
           });
         }
       }
@@ -378,7 +398,6 @@ async function feedHandler(req, res) {
 
     const xml = buildZboziXml(items);
 
-    // Cache for FEED_CACHE_SECONDS
     cachedFeedXml = xml;
     cachedFeedUntil = Date.now() + FEED_CACHE_SECONDS * 1000;
 
@@ -409,5 +428,6 @@ app.get("/", (req, res) =>
 app.listen(PORT, () => {
   console.log(`Feed server running: http://localhost:${PORT}/feed-cz.xml`);
 });
+
 
 
