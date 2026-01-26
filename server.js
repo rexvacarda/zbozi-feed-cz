@@ -10,9 +10,6 @@ const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const PORT = Number(process.env.PORT || 3000);
 
-// Delivery time in days (Zbozi buckets: 0, 1-3, 4-7, 8+)
-const DELIVERY_DATE_DEFAULT = Number(process.env.DELIVERY_DATE_DEFAULT || 8);
-
 // NEW: shipping method + price (Zbozi expects numeric value; use CZK to match PRICE_VAT)
 const DELIVERY_ID_DEFAULT = String(process.env.DELIVERY_ID_DEFAULT || "UPS").trim();
 
@@ -253,9 +250,7 @@ function buildZboziXml(items) {
       param.ele("VAL").txt(p.val);
     }
 
-    si.ele("DELIVERY_DATE").txt(String(item.deliveryDate));
-
-    // NEW: DELIVERY block
+    // DELIVERY block (kept). DELIVERY_DATE removed for Heureka compliance.
     if (item.deliveryId && item.deliveryPrice) {
       const d = si.ele("DELIVERY");
       d.ele("DELIVERY_ID").txt(item.deliveryId);
@@ -383,9 +378,8 @@ async function feedHandler(req, res) {
             ean,
             productNo,
             params,
-            deliveryDate: DELIVERY_DATE_DEFAULT,
 
-            // NEW
+            // DELIVERY_DATE removed
             deliveryId: xmlSafeText(DELIVERY_ID_DEFAULT),
             deliveryPrice: xmlSafeText(formatCzk(DELIVERY_PRICE_DEFAULT)),
           });
@@ -428,6 +422,7 @@ app.get("/", (req, res) =>
 app.listen(PORT, () => {
   console.log(`Feed server running: http://localhost:${PORT}/feed-cz.xml`);
 });
+
 
 
 
