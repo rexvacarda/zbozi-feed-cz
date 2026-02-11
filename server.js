@@ -10,13 +10,15 @@ const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const PORT = Number(process.env.PORT || 3000);
 
-// NEW: shipping method + price (Zbozi expects numeric value; use CZK to match PRICE_VAT)
-const DELIVERY_ID_DEFAULT = String(process.env.DELIVERY_ID_DEFAULT || "UPS").trim();
+// Zbozi/GLAMI: delivery time in days (0=immediately, 1=next day, 3=~3 days etc.)
+const DELIVERY_DATE_DEFAULT = Number(process.env.DELIVERY_DATE_DEFAULT || 3);
 
-// €10.50 ≈ 254.92 CZK at ~24.278 CZK/EUR (set exact CZK here)
-const DELIVERY_PRICE_DEFAULT = Number(process.env.DELIVERY_PRICE_DEFAULT || 254.92);
+// GLAMI: delivery blocks (at least one is recommended/required by many validators)
+const DELIVERY_ID_DEFAULT = xmlSafeEnv(process.env.DELIVERY_ID_DEFAULT || "UPS");
+const DELIVERY_PRICE_DEFAULT = Number(process.env.DELIVERY_PRICE_DEFAULT || 0); // 0 = free shipping
+const DELIVERY_PRICE_COD_DEFAULT = Number(process.env.DELIVERY_PRICE_COD_DEFAULT || 0); // optional
 
-// Cache generated XML to avoid hammering Shopify (important for Zbozi validation)
+// Cache generated XML to avoid hammering Shopify
 const FEED_CACHE_SECONDS = Number(process.env.FEED_CACHE_SECONDS || 900); // 15 min default
 let cachedFeedXml = "";
 let cachedFeedUntil = 0;
@@ -26,6 +28,10 @@ if (!SHOP_MYSHOPIFY_DOMAIN || !SHOP_PUBLIC_DOMAIN || !CLIENT_ID || !CLIENT_SECRE
     "Missing env vars. Need SHOP_MYSHOPIFY_DOMAIN, SHOP_PUBLIC_DOMAIN, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET."
   );
   process.exit(1);
+}
+
+function xmlSafeEnv(s) {
+  return (s || "").toString().trim();
 }
 
 let cachedToken = null;
@@ -53,7 +59,7 @@ async function getAdminAccessToken() {
   if (!json.access_token) throw new Error(`Token response missing access_token: ${JSON.stringify(json)}`);
 
   cachedToken = json.access_token;
-  cachedTokenExpiresAt = Date.now() + json.expires_in * 1000;
+  cachedTokenExpiresAt = Date.now() + (Number(json.expires_in || 3600) * 1000);
   return cachedToken;
 }
 
@@ -104,13 +110,6 @@ function getTranslation(translations, key) {
 }
 
 function formatPrice(amount) {
-  const n = Number(amount);
-  if (!Number.isFinite(n)) return "";
-  return n.toFixed(2);
-}
-
-// NEW: shipping price formatter (same numeric rules as PRICE_VAT: max 2 decimals)
-function formatCzk(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return "";
   return n.toFixed(2);
@@ -217,6 +216,34 @@ function findSizeValue(selectedOptions) {
   return hit?.value ? xmlSafeText(hit.value) : "";
 }
 
+/**
+ * GLAMI requires CATEGORYTEXT. This is a simple "perfume" mapping that passes validation.
+ * Later we can expand this to full GLAMI taxonomy based on productType/tags/metafields.
+ */
+function getCategoryText({ productName, vendor }) {
+  const name = (productName || "").toLowerCase();
+  const brand = (vendor || "").toLowerCase();
+
+  const perfumeLike =
+    name.includes("parf") ||
+    name.includes("perfume") ||
+    name.includes("fragrance") ||
+    name.includes("voda") ||
+    name.includes("edp") ||
+    name.includes("edt") ||
+    name.includes("sample") ||
+    name.includes("vzorek") ||
+    name.includes("decant") ||
+    name.includes("ml");
+
+  if (perfumeLike || brand) {
+    // Keep it broad but correct for perfumes
+    return "Krása a zdraví | Parfémy | Unisex";
+  }
+
+  return "Krása a zdraví";
+}
+
 function buildZboziXml(items) {
   const root = create({ version: "1.0", encoding: "UTF-8" })
     .ele("SHOP")
@@ -232,6 +259,9 @@ function buildZboziXml(items) {
     si.ele("URL").txt(item.url);
     si.ele("IMGURL").txt(item.imgUrl);
     si.ele("PRICE_VAT").txt(item.priceVat);
+
+    // NEW: GLAMI required
+    si.ele("CATEGORYTEXT").txt(item.categoryText || "Krása a zdraví");
 
     if (item.manufacturer) si.ele("MANUFACTURER").txt(item.manufacturer);
     if (item.ean) si.ele("EAN").txt(item.ean);
@@ -250,12 +280,15 @@ function buildZboziXml(items) {
       param.ele("VAL").txt(p.val);
     }
 
-    // DELIVERY block (kept). DELIVERY_DATE removed for Heureka compliance.
-    if (item.deliveryId && item.deliveryPrice) {
-      const d = si.ele("DELIVERY");
-      d.ele("DELIVERY_ID").txt(item.deliveryId);
-      d.ele("DELIVERY_PRICE").txt(item.deliveryPrice);
-      // (optional) d.ele("DELIVERY_PRICE_COD").txt("...") if you offer cash on delivery
+    // Keep DELIVERY_DATE (Zbozi style)
+    si.ele("DELIVERY_DATE").txt(String(item.deliveryDate));
+
+    // NEW: GLAMI commonly expects DELIVERY block(s)
+    for (const d of item.deliveries || []) {
+      const del = si.ele("DELIVERY");
+      del.ele("DELIVERY_ID").txt(d.id);
+      del.ele("DELIVERY_PRICE").txt(formatPrice(d.price));
+      if (Number.isFinite(d.priceCod)) del.ele("DELIVERY_PRICE_COD").txt(formatPrice(d.priceCod));
     }
   }
 
@@ -292,7 +325,7 @@ async function feedHandler(req, res) {
                 value
               }
 
-              variants(first: 20) {
+              variants(first: 50) {
                 edges {
                   node {
                     legacyResourceId
@@ -340,7 +373,6 @@ async function feedHandler(req, res) {
 
         const manufacturer = xmlSafeText(p.vendor || "");
         const itemGroupId = xmlSafeText(String(p.legacyResourceId || "").trim());
-
         const altImgUrls = alternativeImageUrls(p, imgUrl).map(xmlSafeText);
 
         const variants = inStockVariants(p.variants?.edges);
@@ -365,6 +397,11 @@ async function feedHandler(req, res) {
 
           const productName = sizeVal ? `${productNameBase} ${sizeVal}` : productNameBase;
 
+          const categoryText = getCategoryText({
+            productName,
+            vendor: manufacturer,
+          });
+
           items.push({
             itemId: xmlSafeText(variantIdNum),
             itemGroupId,
@@ -378,10 +415,16 @@ async function feedHandler(req, res) {
             ean,
             productNo,
             params,
+            deliveryDate: DELIVERY_DATE_DEFAULT,
+            categoryText: xmlSafeText(categoryText),
 
-            // DELIVERY_DATE removed
-            deliveryId: xmlSafeText(DELIVERY_ID_DEFAULT),
-            deliveryPrice: xmlSafeText(formatCzk(DELIVERY_PRICE_DEFAULT)),
+            deliveries: [
+              {
+                id: DELIVERY_ID_DEFAULT,
+                price: DELIVERY_PRICE_DEFAULT,
+                priceCod: DELIVERY_PRICE_COD_DEFAULT,
+              },
+            ],
           });
         }
       }
@@ -403,7 +446,7 @@ async function feedHandler(req, res) {
         {
           error: String(err?.message || err),
           hint:
-            "If you see THROTTLED, increase FEED_CACHE_SECONDS. If variants are missing, increase variants(first: 20).",
+            "If you see THROTTLED, increase FEED_CACHE_SECONDS. If variants are missing, increase variants(first: 50).",
         },
         null,
         2
@@ -422,7 +465,5 @@ app.get("/", (req, res) =>
 app.listen(PORT, () => {
   console.log(`Feed server running: http://localhost:${PORT}/feed-cz.xml`);
 });
-
-
 
 
