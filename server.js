@@ -114,8 +114,11 @@ function removeSizeFromName(name) {
   // remove "2ml", "1.7 ml", "10ML"
   s = s.replace(/\s*\b\d+(?:[.,]\d+)?\s*ml\b/gi, " ");
 
-  // remove "0.06 fl. oz.", "0.06 fl oz", "0.06 oz"
+  // remove "0.06 fl. oz.", "0.06 fl oz", "0.06 oz", "0.07 fl.o.z."
   s = s.replace(/\s*\b\d+(?:[.,]\d+)?\s*(?:(?:fl\.?\s*)?(?:o\.?\s*)?z\.?|oz\.?)\b/gi, " ");
+
+  // 🔴 NEW — remove leftover dots, commas and double spaces after deletion
+  s = s.replace(/\s*[.,]\s*/g, " ");
 
   // remove empty brackets
   s = s.replace(/\(\s*\)/g, " ");
