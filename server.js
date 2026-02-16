@@ -109,6 +109,15 @@ function inStockVariants(variantEdges) {
   return out;
 }
 
+/**
+ * GLAMI FIX (SIZE):
+ * Extract only the FIRST "<number>ml" from the variant option value.
+ * Supports decimals: 1.7ml, 2 ml, 10ML, etc.
+ * Ignores fl oz completely.
+ *
+ * Example:
+ * "Creed Aventus official perfume sample 1.7ml 0.06 fl. oz." -> "1.7ml"
+ */
 function findSizeValue(selectedOptions) {
   const opts = selectedOptions || [];
   const hit =
@@ -117,8 +126,13 @@ function findSizeValue(selectedOptions) {
 
   if (!hit?.value) return "";
 
-  // CLEAN SIZE for GLAMI
-  return hit.value.replace(/[^0-9mlML]/g, "").toLowerCase();
+  const raw = String(hit.value).toLowerCase();
+
+  // pick first number + optional decimal + ml
+  const match = raw.match(/(\d+(?:\.\d+)?)\s*ml/);
+  if (match) return `${match[1]}ml`;
+
+  return "";
 }
 
 function getCategoryText() {
@@ -168,6 +182,7 @@ function buildXml(items) {
 
     if (item.size) {
       const param = si.ele("PARAM");
+      // keep Czech label if you prefer (GLAMI is fine with either)
       param.ele("PARAM_NAME").txt("SIZE");
       param.ele("VAL").txt(item.size);
     }
