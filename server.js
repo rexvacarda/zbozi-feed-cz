@@ -99,6 +99,30 @@ function stripHtml(html) {
     .trim();
 }
 
+/* ================================
+   GLAMI PRODUCTNAME FIX (ADD HERE)
+================================ */
+
+function normalizeSpaces(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+// Remove ml + fl oz patterns from product titles (for GLAMI PRODUCTNAME)
+function removeSizeFromName(name) {
+  let s = String(name || "");
+
+  // remove "2ml", "1.7 ml", "10ML"
+  s = s.replace(/\s*\b\d+(?:[.,]\d+)?\s*ml\b/gi, " ");
+
+  // remove "0.06 fl. oz.", "0.06 fl oz", "0.06 oz"
+  s = s.replace(/\s*\b\d+(?:[.,]\d+)?\s*(?:fl\.?\s*)?oz\.?\b/gi, " ");
+
+  // remove empty brackets
+  s = s.replace(/\(\s*\)/g, " ");
+
+  return normalizeSpaces(s);
+}
+
 function getTranslation(translations, key) {
   const t = (translations || []).find((x) => x.key === key);
   return t?.value || "";
@@ -154,9 +178,10 @@ async function adminGraphQL(query, variables = {}) {
     const currentlyAvailable = Number(throttle?.currentlyAvailable || 0);
 
     if (throttled) {
-      const waitMs = Number.isFinite(restoreRate) && restoreRate > 0
-        ? Math.max(2000, Math.ceil((100 / restoreRate) * 1000))
-        : Math.min(30000, 500 * Math.pow(2, attempt));
+      const waitMs =
+        Number.isFinite(restoreRate) && restoreRate > 0
+          ? Math.max(2000, Math.ceil((100 / restoreRate) * 1000))
+          : Math.min(30000, 500 * Math.pow(2, attempt));
       await sleep(waitMs);
       continue;
     }
@@ -341,6 +366,7 @@ async function feedHandler(req, res) {
         const translations = p.translations || [];
         const titleCsRaw = getTranslation(translations, "title") || p.title;
         const productNameBase = xmlSafeText(titleCsRaw);
+        const productNameClean = removeSizeFromName(productNameBase);
 
         const descHtmlCsRaw =
           getTranslation(translations, "description_html") ||
@@ -374,7 +400,7 @@ async function feedHandler(req, res) {
           if (sizeVal) params.push({ name: "SIZE", val: sizeVal }); // GLAMI prefers SIZE
 
           // GLAMI FIX: PRODUCTNAME must NOT contain size
-          const productName = productNameBase;
+          const productName = productNameClean;
 
           items.push({
             itemId: xmlSafeText(variantIdNum),
