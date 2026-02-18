@@ -415,8 +415,12 @@ async function feedHandler(req, res) {
 
         for (const v of variants) {
           const cp = v.contextualPricing?.price;
-          const priceVat = cp?.amount ? formatPrice(cp.amount) : "";
-          if (!priceVat) continue;
+const priceNumber = cp?.amount ? Number(cp.amount) : 0;
+
+// ❗ NEW: exclude expensive products (full bottles)
+if (!priceNumber || priceNumber > 1000) continue;
+
+const priceVat = formatPrice(priceNumber);
 
           const variantIdNum = String(v.legacyResourceId || "").trim();
           if (!variantIdNum) continue;
