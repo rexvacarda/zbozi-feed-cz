@@ -418,7 +418,7 @@ async function feedHandler(req, res) {
 const priceNumber = cp?.amount ? Number(cp.amount) : 0;
 
 // ❗ NEW: exclude expensive products (full bottles)
-if (!priceNumber || priceNumber > 1000) continue;
+if (!priceNumber || priceNumber > 520) continue;
 
 const priceVat = formatPrice(priceNumber);
 
