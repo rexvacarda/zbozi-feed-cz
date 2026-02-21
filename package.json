@@ -1,18 +1,12 @@
 {
-  "name": "zbozi-feed",
+  "name": "gmc-feed-czech",
   "version": "1.0.0",
-  "description": "",
   "type": "module",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "dev": "node server.js"
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "dotenv": "^17.2.3",
-    "express": "^5.2.1",
-    "xmlbuilder2": "^4.0.3"
+    "express": "^4.19.2"
   }
 }

@@ -1,375 +1,219 @@
 import express from "express";
-import "dotenv/config";
-import { create } from "xmlbuilder2";
 
 const app = express();
 
-const SHOP_MYSHOPIFY_DOMAIN = process.env.SHOP_MYSHOPIFY_DOMAIN; // creedperfumesamples.myshopify.com
-const SHOP_PUBLIC_DOMAIN = process.env.SHOP_PUBLIC_DOMAIN; // smelltoimpress.cz
-const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-const PORT = Number(process.env.PORT || 3000);
+const {
+  PORT = 3000,
 
-// Zbozi/GLAMI: delivery time in days (0=immediately, 1=next day, 3=~3 days etc.)
-const DELIVERY_DATE_DEFAULT = Number(process.env.DELIVERY_DATE_DEFAULT || 3);
+  // Shopify
+  SHOP_MYSHOPIFY_DOMAIN, // e.g. "smelltoimpress.myshopify.com"
+  SHOPIFY_CLIENT_ID,
+  SHOPIFY_CLIENT_SECRET,
 
-// GLAMI: delivery blocks (at least one is recommended/required by many validators)
-const DELIVERY_ID_DEFAULT = xmlSafeEnv(process.env.DELIVERY_ID_DEFAULT || "UPS");
-const DELIVERY_PRICE_DEFAULT = Number(process.env.DELIVERY_PRICE_DEFAULT || 0); // 0 = free shipping
-const DELIVERY_PRICE_COD_DEFAULT = Number(process.env.DELIVERY_PRICE_COD_DEFAULT || 0); // optional
+  // Public CZ shop URL for product links
+  CZ_PUBLIC_DOMAIN, // e.g. "https://smelltoimpress.com/cs" OR "https://smelltoimpress.cz"
 
-// Cache generated XML to avoid hammering Shopify
-const FEED_CACHE_SECONDS = Number(process.env.FEED_CACHE_SECONDS || 900); // 15 min default
-let cachedFeedXml = "";
-let cachedFeedUntil = 0;
+  // Feed controls
+  FEED_CACHE_SECONDS = "900",
+  CZ_ONLY_IN_STOCK = "true",
 
-if (!SHOP_MYSHOPIFY_DOMAIN || !SHOP_PUBLIC_DOMAIN || !CLIENT_ID || !CLIENT_SECRET) {
-  console.error(
-    "Missing env vars. Need SHOP_MYSHOPIFY_DOMAIN, SHOP_PUBLIC_DOMAIN, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET."
-  );
-  process.exit(1);
+  // Optional defaults
+  BRAND_FALLBACK = "SmellToImpress",
+  CZ_GOOGLE_PRODUCT_CATEGORY = "Health & Beauty > Personal Care > Cosmetics > Perfume & Cologne",
+
+  // If your store returns EUR from Shopify contextualPricing but you need CZK,
+  // set FX_CZK_PER_EUR (e.g. 25.2). Leave empty if Shopify already returns CZK.
+  FX_CZK_PER_EUR = ""
+} = process.env;
+
+function must(v, name) {
+  if (!v) throw new Error(`Missing env var: ${name}`);
 }
 
-function xmlSafeEnv(s) {
-  return (s || "").toString().trim();
-}
-
-let cachedToken = null;
-let cachedTokenExpiresAt = 0;
-
-async function getAdminAccessToken() {
-  const now = Date.now();
-  if (cachedToken && now < cachedTokenExpiresAt - 60_000) return cachedToken; // refresh 60s early
-
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-  });
-
-  const res = await fetch(`https://${SHOP_MYSHOPIFY_DOMAIN}/admin/oauth/access_token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-
-  if (!res.ok) throw new Error(`Token HTTP ${res.status}: ${await res.text()}`);
-
-  const json = await res.json();
-  if (!json.access_token) throw new Error(`Token response missing access_token: ${JSON.stringify(json)}`);
-
-  cachedToken = json.access_token;
-  cachedTokenExpiresAt = Date.now() + (Number(json.expires_in || 3600) * 1000);
-  return cachedToken;
-}
-
-/**
- * Decode a small set of common HTML entities that may appear in Shopify HTML.
- * Most importantly: &nbsp; is NOT a valid XML entity and will break XML parsers.
- */
-function decodeBasicEntities(s) {
-  if (!s) return "";
-  return String(s)
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
-}
-
-function xmlSafeText(s) {
-  if (!s) return "";
-  return decodeBasicEntities(s).replace(/\s+/g, " ").trim();
-}
-
-function cleanDescription(text) {
-  if (!text) return "";
-  const t = xmlSafeText(text);
-  return t.length > 320 ? t.slice(0, 317) + "..." : t;
+function boolEnv(v, fallback = false) {
+  if (v == null) return fallback;
+  return String(v).toLowerCase() === "true";
 }
 
 function stripHtml(html) {
-  if (!html) return "";
-  return String(html)
-    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
+  return String(html ?? "")
+    .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-/* ================================
-   GLAMI PRODUCTNAME FIX (ADD HERE)
-================================ */
-
-function normalizeSpaces(s) {
-  return String(s || "").replace(/\s+/g, " ").trim();
+function xmlEscape(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
-// Remove ml + fl oz patterns from product titles (for GLAMI PRODUCTNAME)
-function removeSizeFromName(name) {
-  let s = String(name || "");
-
-  // remove "2ml", "1.7 ml", "10ML"
-  s = s.replace(/\s*\b\d+(?:[.,]\d+)?\s*ml\b/gi, " ");
-
-  // remove "0.06 fl. oz.", "0.06 fl oz", "0.06 oz", "0.07 fl.o.z."
-  s = s.replace(/\s*\b\d+(?:[.,]\d+)?\s*(?:(?:fl\.?\s*)?(?:o\.?\s*)?z\.?|oz\.?)\b/gi, " ");
-
-  // 🔴 NEW — remove leftover dots, commas and double spaces after deletion
-  s = s.replace(/\s*[.,]\s*/g, " ");
-
-  // remove empty brackets
-  s = s.replace(/\(\s*\)/g, " ");
-
-  return normalizeSpaces(s);
+function normalizeBaseUrl(input) {
+  const s = String(input || "").trim();
+  if (!s) return s;
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+  return `https://${s}`;
 }
 
-/* ================================
-   ✅ ADD: remove Czech UI words from description
-   - removes "Čeština"
-   - removes leading breadcrumb text starting with "Domů ..."
-================================ */
-function removeUiWords(text) {
-  if (!text) return "";
-  let t = String(text);
+function buildProductLink(baseUrl, handle, variantIdNumeric) {
+  const clean = normalizeBaseUrl(baseUrl).replace(/\/$/, "");
+  const url = new URL(`${clean}/products/${handle}`);
+  if (variantIdNumeric) url.searchParams.set("variant", String(variantIdNumeric));
+  return url.toString();
+}
 
-  // remove the single word "Čeština"
-  t = t.replace(/\bČeština\b/gi, " ");
+/**
+ * Google Merchant "id" must be reasonably short.
+ * Use Shopify numeric legacyResourceId first; cap SKU if used.
+ */
+function toShortGmcId(v) {
+  if (v?.legacyResourceId) return String(v.legacyResourceId);
 
-  // remove breadcrumb "Domů ..." up to "O této vůni" (if present)
-  t = t.replace(/^\s*Domů[\s\S]*?(?=\bO této vůni\b)/i, " ");
+  const sku = String(v?.sku || "").trim();
+  if (sku) return sku.slice(0, 50);
 
-  // if "O této vůni" isn't present, still remove leading "Domů"
-  t = t.replace(/^\s*Domů\b/i, " ");
+  const m = String(v?.id || "").match(/(\d+)\s*$/);
+  if (m) return m[1];
 
-  // normalize separators (sometimes breadcrumbs contain ›)
-  t = t.replace(/\s*›\s*/g, " ");
+  return "v";
+}
 
-  return t.replace(/\s+/g, " ").trim();
+// ----------------------
+// Admin token (24h) cache
+// ----------------------
+let tokenCache = { token: null, expiresAtMs: 0 };
+
+async function getAdminToken() {
+  must(SHOP_MYSHOPIFY_DOMAIN, "SHOP_MYSHOPIFY_DOMAIN");
+  must(SHOPIFY_CLIENT_ID, "SHOPIFY_CLIENT_ID");
+  must(SHOPIFY_CLIENT_SECRET, "SHOPIFY_CLIENT_SECRET");
+
+  const now = Date.now();
+  if (tokenCache.token && now < tokenCache.expiresAtMs) return tokenCache.token;
+
+  const url = `https://${SHOP_MYSHOPIFY_DOMAIN}/admin/oauth/access_token`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+      grant_type: "client_credentials"
+    })
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Token error ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  if (!data.access_token) throw new Error("No access_token returned from Shopify");
+
+  tokenCache = {
+    token: data.access_token,
+    expiresAtMs: now + 23 * 60 * 60 * 1000
+  };
+
+  return tokenCache.token;
+}
+
+async function adminGraphQL(query, variables = {}) {
+  const token = await getAdminToken();
+
+  const res = await fetch(`https://${SHOP_MYSHOPIFY_DOMAIN}/admin/api/2025-01/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token
+    },
+    body: JSON.stringify({ query, variables })
+  });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Admin GraphQL HTTP ${res.status}: ${JSON.stringify(json).slice(0, 1000)}`);
+  }
+  if (json.errors?.length) {
+    throw new Error(`Admin GraphQL errors: ${JSON.stringify(json.errors).slice(0, 1500)}`);
+  }
+  return json.data;
+}
+
+// ----------------------
+// Feed cache
+// ----------------------
+let feedCache = { xml: null, expiresAtMs: 0 };
+
+function availabilityFromQty(qty) {
+  return qty > 0 ? "in stock" : "out of stock";
 }
 
 function getTranslation(translations, key) {
   const t = (translations || []).find((x) => x.key === key);
-  return t?.value || "";
+  return t?.value || null;
 }
 
-function formatPrice(amount) {
-  const n = Number(amount);
-  if (!Number.isFinite(n)) return "";
-  return n.toFixed(2);
-}
+function toCzkAmount(amountStr, currencyCode) {
+  const amount = Number(amountStr);
+  if (!Number.isFinite(amount)) return null;
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// Throttle-aware Admin GraphQL with retries
-async function adminGraphQL(query, variables = {}) {
-  const token = await getAdminAccessToken();
-  const url = `https://${SHOP_MYSHOPIFY_DOMAIN}/admin/api/2025-07/graphql.json`;
-
-  for (let attempt = 1; attempt <= 8; attempt++) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": token,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
-
-    const text = await res.text();
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      throw new Error(`Admin GraphQL non-JSON response (HTTP ${res.status}): ${text.slice(0, 500)}`);
-    }
-
-    // HTTP throttling (429)
-    if (res.status === 429) {
-      const retryAfter = Number(res.headers.get("retry-after") || "1");
-      await sleep(Math.min(30, Math.max(1, retryAfter)) * 1000);
-      continue;
-    }
-
-    const errors = json?.errors || [];
-    const throttled = errors.some(
-      (e) => e?.extensions?.code === "THROTTLED" || (e?.message || "").toLowerCase().includes("throttled")
-    );
-
-    const throttle = json?.extensions?.cost?.throttleStatus;
-    const restoreRate = Number(throttle?.restoreRate || 50);
-    const currentlyAvailable = Number(throttle?.currentlyAvailable || 0);
-
-    if (throttled) {
-      const waitMs =
-        Number.isFinite(restoreRate) && restoreRate > 0
-          ? Math.max(2000, Math.ceil((100 / restoreRate) * 1000))
-          : Math.min(30000, 500 * Math.pow(2, attempt));
-      await sleep(waitMs);
-      continue;
-    }
-
-    if (errors.length) {
-      throw new Error(`Admin GraphQL errors: ${JSON.stringify(errors)}`);
-    }
-
-    if (Number.isFinite(currentlyAvailable) && currentlyAvailable < 50) {
-      await sleep(1000);
-    }
-
-    if (!res.ok) {
-      throw new Error(`Admin GraphQL HTTP ${res.status}: ${text.slice(0, 500)}`);
-    }
-
-    return json.data;
+  // If Shopify already returns CZK, keep it.
+  if (String(currencyCode).toUpperCase() === "CZK") {
+    return { amount: amount.toFixed(2), currency: "CZK" };
   }
 
-  throw new Error("Admin GraphQL throttled too long; retries exhausted.");
-}
-
-function firstImageUrl(p) {
-  return p.featuredImage?.url || p.images?.edges?.[0]?.node?.url || "";
-}
-
-function alternativeImageUrls(p, primaryUrl) {
-  const urls = (p.images?.edges || []).map((e) => e?.node?.url).filter(Boolean);
-  const unique = [...new Set(urls)];
-  return unique.filter((u) => u !== primaryUrl).slice(0, 10);
-}
-
-/**
- * FIX: keep official samples (inventory not tracked → inventoryQuantity null)
- */
-function inStockVariants(variantEdges) {
-  const out = [];
-  for (const e of variantEdges || []) {
-    const v = e.node;
-    const qty = v.inventoryQuantity;
-
-    const tracked = typeof qty === "number";
-    const hasStock = tracked && qty > 0;
-    const notTracked = qty === null || qty === undefined;
-
-    if (hasStock || notTracked) out.push(v);
-  }
-  return out;
-}
-
-/**
- * FIX: extract only the FIRST "<number>ml" including decimals (1.7ml)
- */
-function findSizeValue(selectedOptions) {
-  const opts = selectedOptions || [];
-  const hit =
-    opts.find((o) => (o?.name || "").toLowerCase() === "size") ||
-    opts.find((o) => (o?.name || "").toLowerCase() === "velikost");
-
-  if (!hit?.value) return "";
-
-  const raw = String(hit.value).toLowerCase();
-  const match = raw.match(/(\d+(?:\.\d+)?)\s*ml/);
-
-  return match ? `${match[1]}ml` : "";
-}
-
-/**
- * GLAMI requires CATEGORYTEXT.
- */
-function getCategoryText() {
-  return "Krása a zdraví | Parfémy | Unisex";
-}
-
-function buildZboziXml(items) {
-  const root = create({ version: "1.0", encoding: "UTF-8" })
-    .ele("SHOP")
-    .att("xmlns", "http://www.zbozi.cz/ns/offer/1.0");
-
-  for (const item of items) {
-    const si = root.ele("SHOPITEM");
-
-    si.ele("ITEM_ID").txt(item.itemId);
-    if (item.itemGroupId) si.ele("ITEMGROUP_ID").txt(item.itemGroupId);
-
-    si.ele("PRODUCTNAME").txt(item.productName);
-    si.ele("URL").txt(item.url);
-    si.ele("IMGURL").txt(item.imgUrl);
-    si.ele("PRICE_VAT").txt(item.priceVat);
-
-    si.ele("CATEGORYTEXT").txt(item.categoryText || "Krása a zdraví");
-
-    if (item.manufacturer) si.ele("MANUFACTURER").txt(item.manufacturer);
-
-    // ✅ ADD BRAND (same value as manufacturer)
-    if (item.manufacturer) si.ele("BRAND").txt(item.manufacturer);
-
-    if (item.ean) si.ele("EAN").txt(item.ean);
-    if (item.productNo) si.ele("PRODUCTNO").txt(item.productNo);
-
-    si.ele("CONDITION").txt("new");
-    si.ele("DESCRIPTION").txt(item.description);
-
-    for (const alt of item.altImgUrls || []) {
-      si.ele("IMGURL_ALTERNATIVE").txt(alt);
+  // If Shopify returns EUR (common), optionally convert using FX_CZK_PER_EUR.
+  if (String(currencyCode).toUpperCase() === "EUR") {
+    const fx = Number(FX_CZK_PER_EUR);
+    if (!Number.isFinite(fx) || fx <= 0) {
+      // No FX provided -> cannot safely convert
+      return null;
     }
-
-    for (const p of item.params || []) {
-      const param = si.ele("PARAM");
-      param.ele("PARAM_NAME").txt(p.name);
-      param.ele("VAL").txt(p.val);
-    }
-
-    si.ele("DELIVERY_DATE").txt(String(item.deliveryDate));
-
-    for (const d of item.deliveries || []) {
-      const del = si.ele("DELIVERY");
-      del.ele("DELIVERY_ID").txt(d.id);
-      del.ele("DELIVERY_PRICE").txt(formatPrice(d.price));
-    }
+    const czk = amount * fx;
+    return { amount: czk.toFixed(2), currency: "CZK" };
   }
 
-  return root.end({ prettyPrint: true });
+  // Unknown currency -> cannot safely convert
+  return null;
 }
 
-async function feedHandler(req, res) {
-  try {
-    const now = Date.now();
-    if (cachedFeedXml && now < cachedFeedUntil) {
-      res.setHeader("Content-Type", "application/xml; charset=utf-8");
-      res.status(200).send(cachedFeedXml);
-      return;
-    }
+async function fetchAllProductsPaginated() {
+  const query = `
+    query Products($first: Int!, $after: String) {
+      products(first: $first, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            id
+            legacyResourceId
+            handle
+            title
+            vendor
+            descriptionHtml
+            featuredImage { url }
+            images(first: 1) { edges { node { url } } }
 
-    const query = `
-      query ZboziAdminFeed($first: Int!, $after: String) {
-        products(first: $first, after: $after, query: "status:active") {
-          pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              legacyResourceId
-              title
-              vendor
-              handle
-              descriptionHtml
-              featuredImage { url }
-              images(first: 4) { edges { node { url } } }
+            translations(locale: "cs") {
+              key
+              value
+            }
 
-              translations(locale: "cs") { key value }
+            variants(first: 100) {
+              edges {
+                node {
+                  id
+                  legacyResourceId
+                  title
+                  sku
+                  barcode
+                  inventoryQuantity
 
-              variants(first: 50) {
-                edges {
-                  node {
-                    legacyResourceId
-                    sku
-                    barcode
-                    inventoryQuantity
-                    selectedOptions { name value }
-                    contextualPricing(context: { country: CZ }) {
-                      price { amount currencyCode }
-                    }
+                  contextualPricing(context: {country: CZ}) {
+                    price { amount currencyCode }
                   }
                 }
               }
@@ -377,123 +221,128 @@ async function feedHandler(req, res) {
           }
         }
       }
-    `;
-
-    const items = [];
-    let after = null;
-
-    while (true) {
-      const data = await adminGraphQL(query, { first: 100, after });
-      const conn = data.products;
-
-      for (const edge of conn.edges) {
-        const p = edge.node;
-
-        const imgUrl = firstImageUrl(p);
-        if (!imgUrl) continue;
-
-        const translations = p.translations || [];
-        const titleCsRaw = getTranslation(translations, "title") || p.title;
-        const productNameBase = xmlSafeText(titleCsRaw);
-        const productNameClean = removeSizeFromName(productNameBase);
-
-        const descHtmlCsRaw =
-          getTranslation(translations, "description_html") ||
-          getTranslation(translations, "body_html") ||
-          p.descriptionHtml ||
-          "";
-
-        // ✅ CHANGE: remove "Čeština" + "Domů ..." without removing Czech language
-        const description = cleanDescription(removeUiWords(xmlSafeText(stripHtml(descHtmlCsRaw))));
-
-        const manufacturer = xmlSafeText(p.vendor || "");
-        const itemGroupId = xmlSafeText(String(p.legacyResourceId || "").trim());
-        const altImgUrls = alternativeImageUrls(p, imgUrl).map(xmlSafeText);
-
-        const variants = inStockVariants(p.variants?.edges);
-        if (!variants.length) continue;
-
-        for (const v of variants) {
-          const cp = v.contextualPricing?.price;
-const priceNumber = cp?.amount ? Number(cp.amount) : 0;
-
-// ❗ NEW: exclude expensive products (full bottles)
-if (!priceNumber || priceNumber > 520) continue;
-
-const priceVat = formatPrice(priceNumber);
-
-          const variantIdNum = String(v.legacyResourceId || "").trim();
-          if (!variantIdNum) continue;
-
-          const url = `https://${SHOP_PUBLIC_DOMAIN}/products/${p.handle}?variant=${variantIdNum}`;
-
-          const ean = xmlSafeText(v.barcode || "");
-          const productNo = xmlSafeText(v.sku || "") || productNameBase;
-
-          const sizeVal = findSizeValue(v.selectedOptions);
-          const params = [];
-          if (sizeVal) params.push({ name: "SIZE", val: sizeVal }); // GLAMI prefers SIZE
-
-          const productName = productNameClean;
-
-          items.push({
-            itemId: xmlSafeText(variantIdNum),
-            itemGroupId,
-            productName: xmlSafeText(productName),
-            description,
-            url: xmlSafeText(url),
-            imgUrl: xmlSafeText(imgUrl),
-            altImgUrls,
-            priceVat: xmlSafeText(priceVat),
-            manufacturer,
-            ean,
-            productNo,
-            params,
-            deliveryDate: DELIVERY_DATE_DEFAULT,
-            categoryText: getCategoryText(),
-            deliveries: [
-              {
-                id: DELIVERY_ID_DEFAULT,
-                price: DELIVERY_PRICE_DEFAULT,
-              },
-            ],
-          });
-        }
-      }
-
-      if (!conn.pageInfo.hasNextPage) break;
-      after = conn.pageInfo.endCursor;
     }
+  `;
 
-    const xml = buildZboziXml(items);
+  let after = null;
+  const all = [];
 
-    cachedFeedXml = xml;
-    cachedFeedUntil = Date.now() + FEED_CACHE_SECONDS * 1000;
+  while (true) {
+    const data = await adminGraphQL(query, { first: 100, after });
+    const conn = data.products;
 
-    res.setHeader("Content-Type", "application/xml; charset=utf-8");
-    res.status(200).send(xml);
-  } catch (err) {
-    res.status(500).type("application/json").send(
-      JSON.stringify(
-        {
-          error: String(err?.message || err),
-          hint:
-            "If you see THROTTLED, increase FEED_CACHE_SECONDS. If variants are missing, increase variants(first: 50).",
-        },
-        null,
-        2
-      )
-    );
+    for (const e of conn.edges) all.push(e.node);
+
+    if (!conn.pageInfo.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
   }
+
+  return all;
 }
 
-app.get("/feed-cz.xml", feedHandler);
-app.get("/feed.xml", feedHandler);
+app.get("/health", (_, res) => res.status(200).send("ok"));
 
-app.get("/", (req, res) =>
-  res.type("text").send("OK. Use /feed-cz.xml (Czech feed). Also available: /feed.xml")
-);
+app.get("/feed-cz.xml", async (_, res) => {
+  try {
+    must(CZ_PUBLIC_DOMAIN, "CZ_PUBLIC_DOMAIN");
 
-app.listen(PORT, () => {
-  console.log(`Feed server running: http://localhost:${PORT}/feed-cz.xml`);
+    const now = Date.now();
+    const ttlMs = Number(FEED_CACHE_SECONDS) * 1000;
+
+    if (feedCache.xml && now < feedCache.expiresAtMs) {
+      res.setHeader("Content-Type", "application/rss+xml; charset=UTF-8");
+      res.setHeader("Cache-Control", `public, max-age=${Math.max(60, Number(FEED_CACHE_SECONDS))}`);
+      return res.status(200).send(feedCache.xml);
+    }
+
+    const onlyInStock = boolEnv(CZ_ONLY_IN_STOCK, true);
+    const products = await fetchAllProductsPaginated();
+
+    let itemsXml = "";
+
+    for (const p of products) {
+      const img =
+        p.featuredImage?.url ||
+        p.images?.edges?.[0]?.node?.url ||
+        "";
+
+      // Prefer Czech translations when present
+      const titleCS = getTranslation(p.translations, "title") || p.title;
+      const bodyCS = getTranslation(p.translations, "body_html") || p.descriptionHtml;
+
+      const description =
+        stripHtml(bodyCS) ||
+        stripHtml(p.descriptionHtml) ||
+        titleCS;
+
+      const brand = p.vendor || BRAND_FALLBACK;
+
+      for (const ve of (p.variants?.edges || [])) {
+        const v = ve.node;
+
+        const qty = Number(v.inventoryQuantity ?? 0);
+        if (onlyInStock && qty <= 0) continue;
+
+        const priceObj = v.contextualPricing?.price;
+        if (!priceObj?.amount) continue;
+
+        // Ensure CZK (either Shopify returns CZK, or convert from EUR using FX_CZK_PER_EUR)
+        const czk = toCzkAmount(priceObj.amount, priceObj.currencyCode);
+        if (!czk) continue; // skip if cannot produce CZK reliably
+
+        // ✅ Short, stable ID. If you run multiple country feeds as primary, append -CZ to avoid collisions.
+        const gid = `${toShortGmcId(v)}-CZ`;
+
+        const variantTitle =
+          v.title && v.title !== "Default Title"
+            ? `${titleCS} - ${v.title}`
+            : titleCS;
+
+        const link = buildProductLink(CZ_PUBLIC_DOMAIN, p.handle, v.legacyResourceId);
+
+        const gtinXml = ""; 
+        const mpnXml = ""; 
+        const identifierExistsXml = `<g:identifier_exists>false</g:identifier_exists>`;
+
+        itemsXml += `
+  <item>
+    <g:id>${xmlEscape(gid)}</g:id>
+    <g:title>${xmlEscape(variantTitle)}</g:title>
+    <g:description>${xmlEscape(description)}</g:description>
+    <g:link>${xmlEscape(link)}</g:link>
+    <g:image_link>${xmlEscape(img)}</g:image_link>
+    <g:availability>${availabilityFromQty(qty)}</g:availability>
+    <g:price>${xmlEscape(`${czk.amount} ${czk.currency}`)}</g:price>
+    <g:condition>new</g:condition>
+    <g:brand>${xmlEscape(brand)}</g:brand>
+    <g:google_product_category>${xmlEscape(CZ_GOOGLE_PRODUCT_CATEGORY)}</g:google_product_category>
+    ${gtinXml}
+    ${mpnXml}
+    ${identifierExistsXml}
+  </item>`;
+      }
+    }
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+<channel>
+  <title>${xmlEscape("SmellToImpress Czech Republic")}</title>
+  <link>${xmlEscape(normalizeBaseUrl(CZ_PUBLIC_DOMAIN))}</link>
+  <description>${xmlEscape("Google Merchant Center feed (CZ)")}</description>
+  <language>cs</language>
+  ${itemsXml}
+</channel>
+</rss>
+`;
+
+    feedCache = { xml, expiresAtMs: Date.now() + ttlMs };
+
+    res.setHeader("Content-Type", "application/rss+xml; charset=UTF-8");
+    res.setHeader("Cache-Control", `public, max-age=${Math.max(60, Number(FEED_CACHE_SECONDS))}`);
+    res.status(200).send(xml);
+  } catch (err) {
+    res.status(500).json({ error: "CZ feed failed", message: err?.message || String(err) });
+  }
 });
+
+app.listen(PORT, () => console.log(`GMC CZ feed running on :${PORT}`));
